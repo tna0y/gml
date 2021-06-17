@@ -1,14 +1,17 @@
-package main
+package gml
 
 import (
+	"context"
 	"fmt"
-	"log"
 	"os"
+	"os/exec"
+	"os/signal"
 	"syscall"
 	"time"
 
 	"github.com/NVIDIA/go-nvml/pkg/nvml"
 	"github.com/inhies/go-bytesize"
+	"golang.org/x/sync/errgroup"
 )
 
 func getMemoryUsage(pidTarget uint32, devices []nvml.Device) (usage uint64, err error) {
@@ -37,7 +40,7 @@ func getMemoryUsage(pidTarget uint32, devices []nvml.Device) (usage uint64, err 
 	return
 }
 
-func monitorChild(errChan chan<- error, pid int, limit uint64, devices []nvml.Device) {
+func monitorChild(ctx context.Context, errChan chan<- error, pid int, limit uint64, devices []nvml.Device) {
 	ticker := time.Tick(time.Millisecond * 100)
 	for {
 		select {
@@ -54,6 +57,8 @@ func monitorChild(errChan chan<- error, pid int, limit uint64, devices []nvml.De
 				)
 				return
 			}
+		case <- ctx.Done():
+			return
 		}
 	}
 }
@@ -77,11 +82,28 @@ func getDevices() (devices []nvml.Device, err error) {
 }
 
 func startChild(args []string) (pid int, err error) {
-	return syscall.ForkExec(args[0], args, nil)
+
+	path, err := exec.LookPath(args[0])
+	if err != nil {
+		err = fmt.Errorf("failed to lookup path for \"%s\": %v", args[0], err)
+		return
+	}
+
+	wd, err := os.Getwd()
+	if err != nil {
+		return 0, nil
+	}
+
+	procAttr := syscall.ProcAttr{
+		Dir:   wd,
+		Env:   os.Environ(),
+		Files: []uintptr{os.Stdin.Fd(), os.Stdout.Fd(), os.Stderr.Fd()},
+	}
+
+	return syscall.ForkExec(path, args, &procAttr)
 }
 
 func waitForChild(errChan <-chan error, pid int, signum syscall.Signal) (exitCode int, err error) {
-
 	done := make(chan int)
 	go func() {
 		var waitStatus syscall.WaitStatus
@@ -99,39 +121,73 @@ func waitForChild(errChan <-chan error, pid int, signum syscall.Signal) (exitCod
 	}
 }
 
-func main() {
+
+func passthroughSignals(ctx context.Context, pid int) {
+	signalChan := make(chan os.Signal, 0x100)
+	for i := 1; i < 65; i++ {
+		if syscall.Signal(i) == syscall.SIGCHLD { // we need it for waiting
+			continue
+		}
+		signal.Notify(signalChan, syscall.Signal(i))
+	}
+	for {
+		select {
+		case sig := <- signalChan:
+			_ = syscall.Kill(pid, sig.(syscall.Signal))
+		case <- ctx.Done():
+			return
+		}
+	}
+}
+
+func Run(command []string, limit uint64, sig syscall.Signal) (code int, err error) {
+
 	ret := nvml.Init()
 	if ret != nvml.SUCCESS {
-		log.Fatalf("failed to initialize NVML: %v", nvml.ErrorString(ret))
+		err = fmt.Errorf("failed to initialize NVML: %v", nvml.ErrorString(ret))
 		return
 	}
 
 	defer func() {
 		ret := nvml.Shutdown()
 		if ret != nvml.SUCCESS {
-			log.Fatalf("failed to shutdown NVML: %v", nvml.ErrorString(ret))
+			if err == nil {
+				err = fmt.Errorf("failed to shutdown NVML: %v", nvml.ErrorString(ret))
+			}
 			return
 		}
 	}()
 
 	devices, err := getDevices()
 	if err != nil {
-		log.Fatalf("failed to get GPU list: %v", err)
+		err = fmt.Errorf("failed to get GPU list: %v", err)
 	}
 
-	pid, err := startChild([]string{"ls", "-l", "/"})
+	pid, err := startChild(command)
 	if err != nil {
-		log.Fatalf("failed to start process: %v", err)
+		err = fmt.Errorf("failed to start process: %v", err)
+		return
 	}
 
-	signum := syscall.SIGKILL
-	limit := uint64(1024 * 1024)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	wg, wgCtx := errgroup.WithContext(ctx)
+
+	wg.Go(func() error {
+		passthroughSignals(wgCtx, pid)
+		return nil
+	})
 
 	monitorChan := make(chan error)
-	go monitorChild(monitorChan, pid, limit, devices)
-	exitCode, err := waitForChild(monitorChan, pid, signum)
-	if err != nil {
-		log.Println(err.Error())
-	}
-	os.Exit(exitCode)
+	wg.Go(func() error {
+		monitorChild(wgCtx, monitorChan, pid, uint64(limit), devices)
+		return nil
+	})
+
+	exitCode, err := waitForChild(monitorChan, pid, sig)
+
+	cancel()
+	_ = wg.Wait()
+
+	return exitCode, err
 }
