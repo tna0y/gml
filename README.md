@@ -15,8 +15,8 @@ the process and waits until it returns.
 ## Install
 Pre-compiled binary is available for Linux / x86_64. Install it with following commands:
 ```shell script
-curl -o gml https://github.com/tna0y/gml/releases/download/v0.1/gml-linux-x86_64
-sudo cp gml /usr/local/bin/gml
+curl -L -o gml https://github.com/tna0y/gml/releases/download/v0.1/gml-linux-x86_64
+chmod +x gml && sudo cp gml /usr/local/bin/gml
 ```
 
 ## Usage
